@@ -170,55 +170,67 @@
 
 <footer>Everything happens on this computer — nothing is uploaded to the internet.</footer>
 
+<script>
+/* Start fetching the small core archive immediately (before the app below
+ * even runs), so the file list is ready as fast as possible. */
+window.__coreFetch = fetch("youtube-3d-vision-core.zip")
+  .then((r) => (r.ok ? r.arrayBuffer() : null))
+  .catch(() => null);
+</script>
 <div id="progresswrap"><div id="progressbox"><div id="ptext">Opening your file…</div><div id="pbar"><div id="pfill"></div></div></div></div>
 <div id="toast"></div>
 
 <script>
 "use strict";
 
-/* ---------------- storage (IndexedDB, private to this browser) ---------------- */
+/* ---------------- storage (IndexedDB, private to this browser) ----------------
+ * Design for a fast first paint and a fast revisit:
+ *   - one small "index" record: the file list (path + size + which archive)
+ *   - the raw ZIP archives themselves, stored as blobs
+ * Nothing is decompressed until a file is actually opened, so showing the
+ * list of files takes milliseconds instead of seconds.
+ */
 
-const DB_NAME = "ziphost", STORE = "files";
-let db = null, memStore = new Map(); // fallback for browsers without IndexedDB
+const DB_NAME = "ziphost", STORE = "archive";
+let db = null;
+const memStore = new Map(); // fallback for browsers without IndexedDB
 
 function openDB() {
   return new Promise((resolve) => {
     if (!("indexedDB" in window)) return resolve(null);
-    const req = indexedDB.open(DB_NAME, 2);
+    const req = indexedDB.open(DB_NAME, 3);
     req.onupgradeneeded = () => {
-      if (req.result.objectStoreNames.contains(STORE)) req.result.deleteObjectStore(STORE);
-      req.result.createObjectStore(STORE, { keyPath: "path" });
+      for (const name of req.result.objectStoreNames) req.result.deleteObjectStore(name);
+      req.result.createObjectStore(STORE);
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => resolve(null);
   });
 }
-async function dbPutAll(entries) {
+function idbPut(key, value) {
   if (db) {
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE, "readwrite");
-      const os = tx.objectStore(STORE);
-      os.clear();
-      for (const e of entries) os.put(e);
+      tx.objectStore(STORE).put(value, key);
       tx.oncomplete = () => resolve(true);
       tx.onerror = () => reject(tx.error);
     });
   }
-  memStore = new Map(entries.map((e) => [e.path, e]));
-  return true;
+  memStore.set(key, value);
+  return Promise.resolve(true);
 }
-async function dbGetAll() {
+function idbGet(key) {
   if (db) {
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE, "readonly");
-      const req = tx.objectStore(STORE).getAll();
-      req.onsuccess = () => resolve(req.result || []);
+      const req = tx.objectStore(STORE).get(key);
+      req.onsuccess = () => resolve(req.result ?? null);
       req.onerror = () => reject(req.error);
     });
   }
-  return [...memStore.values()];
+  return Promise.resolve(memStore.has(key) ? memStore.get(key) : null);
 }
-async function dbClear() {
+function idbClear() {
   if (db) {
     return new Promise((resolve) => {
       const tx = db.transaction(STORE, "readwrite");
@@ -227,15 +239,18 @@ async function dbClear() {
       tx.onerror = () => resolve(false);
     });
   }
-  memStore = new Map();
-  return true;
+  memStore.clear();
+  return Promise.resolve(true);
 }
-
-/* ---------------- opening the ZIP ---------------- */
+/* ---------------- opening the ZIP ----------------
+ * Only the ZIP's central directory is read to build the file list (fast);
+ * each file's bytes are decompressed on demand when it is opened.
+ */
 
 const EOCD_SIG = 0x06054b50, CEN_SIG = 0x02014b50, LOC_SIG = 0x04034b50;
 
-async function unzipBytes(buffer, onProgress) {
+/** Read a ZIP's table of contents: Map(path -> {method, compSize, size, dataStart}). */
+function parseZipIndex(buffer) {
   const data = new Uint8Array(buffer);
   const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
 
@@ -249,41 +264,35 @@ async function unzipBytes(buffer, onProgress) {
   let ptr = dv.getUint32(eocd + 16, true);
 
   const td = new TextDecoder();
-  const entries = [];
+  const index = new Map();
   for (let n = 0; n < totalEntries; n++) {
     if (dv.getUint32(ptr, true) !== CEN_SIG) throw new Error("This ZIP file seems damaged.");
     const method     = dv.getUint16(ptr + 10, true);
     const compSize   = dv.getUint32(ptr + 20, true);
+    const size       = dv.getUint32(ptr + 24, true);
     const nameLen    = dv.getUint16(ptr + 28, true);
     const extraLen   = dv.getUint16(ptr + 30, true);
     const commentLen = dv.getUint16(ptr + 32, true);
     const localOff   = dv.getUint32(ptr + 42, true);
     const name = td.decode(data.subarray(ptr + 46, ptr + 46 + nameLen));
     ptr += 46 + nameLen + extraLen + commentLen;
-
     if (name.endsWith("/")) continue; // folder, not a file
-
     const lhNameLen  = dv.getUint16(localOff + 26, true);
     const lhExtraLen = dv.getUint16(localOff + 28, true);
-    const start = localOff + 30 + lhNameLen + lhExtraLen;
-    const raw = data.subarray(start, start + compSize);
-
-    let bytes;
-    if (method === 0) bytes = raw.slice();
-    else if (method === 8) bytes = await inflateRaw(raw);
-    else throw new Error("This ZIP file uses a method this browser can't open.");
-
-    entries.push({ path: name, bytes });
-    if (onProgress && (n % 5 === 0 || n === totalEntries - 1)) onProgress(n + 1, totalEntries, name);
-    if (n >= 65534) break;
+    const dataStart = localOff + 30 + lhNameLen + lhExtraLen;
+    index.set(name, { method, compSize, size, dataStart });
   }
-  return entries;
+  return { data, index };
 }
 
-async function inflateRaw(deflated) {
+/** Decompress a single ZIP entry on demand. */
+async function inflateEntry(archive, entry) {
+  const raw = archive.subarray(entry.dataStart, entry.dataStart + entry.compSize);
+  if (entry.method === 0) return raw.slice(); // stored
+  if (entry.method !== 8) throw new Error("This ZIP file uses a method this browser can't open.");
   if (typeof DecompressionStream === "undefined")
     throw new Error("Please open this page in a current Chrome, Edge, Firefox or Safari.");
-  const stream = new Blob([deflated]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+  const stream = new Blob([raw]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
@@ -306,62 +315,89 @@ const isText = (p) => ["html","htm","css","js","mjs","json","txt","md","svg","gl
 const isImage = (p) => ["png","jpg","jpeg","gif","webp","svg","ico","bmp"].includes(ext(p));
 const isVideo = (p) => ["mp4","webm","ogv","mov"].includes(ext(p));
 
-// plain-language icons for file types
 function iconFor(p) {
-  if (isImage(p)) return "🖼️";
-  if (ext(p) === "html" || ext(p) === "htm") return "🌐";
-  if (isVideo(p)) return "🎬";
-  if (["mp3","wav"].includes(ext(p))) return "🎵";
-  if (isText(p)) return "📄";
-  return "📦";
+  if (isImage(p)) return "\u{1F5BC}\uFE0F";
+  if (ext(p) === "html" || ext(p) === "htm") return "\u{1F310}";
+  if (isVideo(p)) return "\u{1F3AC}";
+  if (["mp3","wav"].includes(ext(p))) return "\u{1F3B5}";
+  if (isText(p)) return "\u{1F4C4}";
+  return "\u{1F4E6}";
 }
 
-let files = [];
-const byPath = new Map();
-let currentPath = null;
+/* ---------------- the archive set ---------------- */
 
-function makeBlobUrl(path) {
-  const e = byPath.get(path);
-  if (!e) return null;
-  return URL.createObjectURL(new Blob([e.bytes], { type: mimeOf(path) }));
+let archiveIndex = [];              // [{path, size, store}] — the file list
+let currentPath = null;
+const archives = new Map();         // store name -> {data, index} (raw zip + parsed)
+const bytesCache = new Map();       // path -> Uint8Array (decompressed on demand)
+
+async function loadArchive(store) {
+  if (archives.has(store)) return archives.get(store);
+  const blob = await idbGet("blob:" + store);
+  if (!blob) return null;
+  const buf = await blob.arrayBuffer();
+  const parsed = parseZipIndex(buf);
+  archives.set(store, parsed);
+  return parsed;
+}
+
+/** A file's bytes: taken from its archive and decompressed on demand. */
+async function getEntryBytes(path) {
+  if (bytesCache.has(path)) return bytesCache.get(path);
+  const entry = archiveIndex.find((f) => f.path === path);
+  if (!entry) return null;
+  const archive = await loadArchive(entry.store);
+  if (!archive) return null;
+  const meta = archive.index.get(path);
+  if (!meta) return null;
+  const bytes = await inflateEntry(archive.data, meta);
+  bytesCache.set(path, bytes);
+  return bytes;
+}
+
+async function makeBlobUrl(path) {
+  const bytes = await getEntryBytes(path);
+  if (!bytes) return null;
+  return URL.createObjectURL(new Blob([bytes], { type: mimeOf(path) }));
 }
 
 /* ---------------- load + remember ---------------- */
 
 async function handleZipFile(file) {
-  showProgress("Opening " + file.name + "…");
+  showProgress("Opening " + file.name + "\u2026");
   try {
     const buf = await file.arrayBuffer();
-    const entries = await unzipBytes(buf, (n, total) => {
-      $("#ptext").textContent = `Opening… ${n} of ${total} files`;
-      $("#pfill").style.width = Math.round((n / total) * 100) + "%";
-    });
-    if (!entries.length) throw new Error("This ZIP file is empty.");
-    await dbPutAll(entries);
+    const parsed = parseZipIndex(buf);
+    if (!parsed.index.size) throw new Error("This ZIP file is empty.");
+    await idbPut("blob:drop", new Blob([buf], { type: "application/zip" }));
+    await storeIndex([...parsed.index.entries()].map(([path, m]) => ({ path, size: m.size, store: "drop" })), file.name);
+    archives.set("drop", parsed);
     await render(file.name, true);
     hideProgress();
-    toast("All set — your files are ready");
+    toast("All set \u2014 your files are ready");
   } catch (err) {
     hideProgress();
     toast("Couldn't open that file: " + err.message, true);
   }
 }
 
+async function storeIndex(entries, zipName) {
+  archiveIndex = entries;
+  await idbPut("index", { entries, zipName, when: Date.now() });
+  try { localStorage.setItem("ziphost-has", "1"); } catch (_) { }
+}
+
 async function render(zipName, justLoaded) {
-  files = await dbGetAll();
-  if (!files.length) return;
-  byPath.clear();
-  for (const f of files) byPath.set(f.path, f);
+  if (!archiveIndex.length) return;
   $("#dropzone").style.display = "none";
   $("#app").classList.add("on");
-  const total = files.reduce((s, f) => s + f.bytes.length, 0);
-  $("#stats").textContent = `${files.length} files · ${fmtBytes(total)}` + (justLoaded ? "" : " · still here from last time");
+  const total = archiveIndex.reduce((s, f) => s + f.size, 0);
+  $("#stats").textContent = `${archiveIndex.length} files \u00B7 ${fmtBytes(total)}` + (justLoaded ? "" : " \u00B7 still here from last time");
   buildTree("");
 
-  // help non-technical users get started: open the "read me" if there is one
   if (justLoaded) {
-    const start = files.find((f) => /readme\.md$/i.test(f.path)) ||
-                  files.find((f) => /\.html?$/i.test(f.path));
+    const start = archiveIndex.find((f) => /readme\.md$/i.test(f.path)) ||
+                  archiveIndex.find((f) => /\.html?$/i.test(f.path));
     if (start) selectFile(start.path);
   }
 }
@@ -372,7 +408,7 @@ function buildTree(filter) {
   const tree = $("#tree");
   tree.innerHTML = "";
   const q = (filter || "").toLowerCase();
-  const visible = q ? files.filter((f) => f.path.toLowerCase().includes(q)) : files;
+  const visible = q ? archiveIndex.filter((f) => f.path.toLowerCase().includes(q)) : archiveIndex;
 
   const root = {};
   for (const f of visible) {
@@ -397,7 +433,7 @@ function buildTree(filter) {
         det.open = q ? true : depth < 1;
         det.style.marginLeft = depth === 0 ? "0" : "16px";
         const sum = document.createElement("summary");
-        sum.textContent = "📂 " + name.slice(0, -1);
+        sum.textContent = "\u{1F4C2} " + name.slice(0, -1);
         det.appendChild(sum);
         renderLevel(node[name], det, depth + 1);
         container.appendChild(det);
@@ -406,7 +442,7 @@ function buildTree(filter) {
         const div = document.createElement("div");
         div.className = "file" + (f.path === currentPath ? " sel" : "");
         div.innerHTML = `<span class="icon">${iconFor(f.path)}</span><span class="fname">${escapeHtml(name)}</span>`;
-        div.title = f.path + " — " + fmtBytes(f.bytes.length);
+        div.title = f.path + " \u2014 " + fmtBytes(f.size);
         div.addEventListener("click", () => selectFile(f.path));
         container.appendChild(div);
       }
@@ -417,37 +453,44 @@ function buildTree(filter) {
 
 /* ---------------- showing a file ---------------- */
 
-function selectFile(path) {
+async function selectFile(path) {
   currentPath = path;
   buildTree($("#search").value);
-  const e = byPath.get(path);
-  if (!e) return;
-  $("#filepath").textContent = path + "  ·  " + fmtBytes(e.bytes.length);
+  $("#filepath").textContent = path + "  \u00B7  opening\u2026";
   const v = $("#viewer");
   v.scrollTop = 0;
 
-  const blobUrl = makeBlobUrl(path);
+  let e;
+  try {
+    e = await getEntryBytes(path);
+  } catch (err) {
+    $("#filepath").textContent = path;
+    v.innerHTML = `<div class="centerwrap"><div class="simplebox"><div class="big">\u26A0\uFE0F</div><div>This file could not be opened.</div></div></div>`;
+    return;
+  }
+  if (!e) return;
+  $("#filepath").textContent = path + "  \u00B7  " + fmtBytes(e.length);
+
+  const blobUrl = await makeBlobUrl(path);
 
   if (isImage(path)) {
-    v.innerHTML = `<div class="centerwrap"><img src="${blobUrl}" alt=""/><div style="color:var(--muted);font-size:13px">${e.bytes.length.toLocaleString()} bytes</div></div>`;
+    v.innerHTML = `<div class="centerwrap"><img src="${blobUrl}" alt=""/><div style="color:var(--muted);font-size:13px">${e.length.toLocaleString()} bytes</div></div>`;
   } else if (isVideo(path)) {
     v.innerHTML = `<div class="centerwrap"><video controls src="${blobUrl}"></video></div>`;
   } else if (ext(path) === "html" || ext(path) === "htm") {
-    // show the page as it would look on a website: its own pictures,
-    // styles and scripts are taken from inside the ZIP
-    const html = rewriteHtml(new TextDecoder().decode(e.bytes), path);
+    const html = await rewriteHtml(new TextDecoder().decode(e), path);
     v.innerHTML = "";
     const frame = document.createElement("iframe");
     frame.setAttribute("sandbox", "allow-scripts allow-forms allow-modals allow-popups");
     frame.srcdoc = html;
     v.appendChild(frame);
   } else if (isText(path)) {
-    const text = new TextDecoder().decode(e.bytes);
-    v.innerHTML = `<pre>${escapeHtml(text.length > 2e6 ? text.slice(0, 2e6) + "\n\n… (very long file — showing the beginning)" : text)}</pre>`;
+    const text = new TextDecoder().decode(e);
+    v.innerHTML = `<pre>${escapeHtml(text.length > 2e6 ? text.slice(0, 2e6) + "\n\n\u2026 (very long file \u2014 showing the beginning)" : text)}</pre>`;
   } else {
     v.innerHTML = `<div class="centerwrap"><div class="simplebox">
       <div class="big">${iconFor(path)}</div>
-      <div><b>${escapeHtml(path.split("/").pop())}</b> — ${fmtBytes(e.bytes.length)}</div>
+      <div><b>${escapeHtml(path.split("/").pop())}</b> \u2014 ${fmtBytes(e.length)}</div>
       <div>This kind of file can't be shown on screen,<br/>but you can still save it with the button above.</div>
     </div></div>`;
   }
@@ -456,77 +499,80 @@ function selectFile(path) {
 /**
  * Make an extracted web page work inside the viewer: its scripts and
  * stylesheets are taken from the ZIP and built in, and its pictures become
- * part of the page itself — so it looks and behaves like on a real website.
+ * part of the page itself \u2014 so it looks and behaves like on a real website.
  */
-function rewriteHtml(html, pagePath) {
+async function rewriteHtml(html, pagePath) {
   const dir = pathDir(pagePath);
   const urlCache = new Map();
 
-  const dataUrl = (target) => {
-    const e = byPath.get(target);
-    if (!e) return null;
+  const dataUrl = async (target) => {
+    const bytes = await getEntryBytes(target);
+    if (!bytes) return null;
     if (!urlCache.has(target)) {
       let bin = "";
       const CH = 32768;
-      for (let i = 0; i < e.bytes.length; i += CH) bin += String.fromCharCode.apply(null, e.bytes.subarray(i, i + CH));
+      for (let i = 0; i < bytes.length; i += CH) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
       urlCache.set(target, "data:" + mimeOf(target) + ";base64," + btoa(bin));
     }
     return urlCache.get(target);
   };
-  const blobFor = (target) => {
-    if (!byPath.has(target)) return null;
-    if (!urlCache.has(target)) urlCache.set(target, makeBlobUrl(target));
+  const blobFor = async (target) => {
+    if (!urlCache.has(target)) urlCache.set(target, await makeBlobUrl(target));
     return urlCache.get(target);
   };
 
   const doc = new DOMParser().parseFromString(html, "text/html");
 
-  doc.querySelectorAll("script[src]").forEach((el) => {
+  for (const el of [...doc.querySelectorAll("script[src]")]) {
     const target = resolvePath(dir, el.getAttribute("src"));
-    const e = target && byPath.get(target);
-    if (!e) { el.remove(); return; }
+    const bytes = target && await getEntryBytes(target);
+    if (!bytes) { el.remove(); continue; }
     const s = doc.createElement("script");
     if (el.type) s.type = el.type;
-    s.textContent = new TextDecoder().decode(e.bytes);
+    s.textContent = new TextDecoder().decode(bytes);
     el.replaceWith(s);
-  });
+  }
 
-  doc.querySelectorAll("link[href]").forEach((el) => {
-    if ((el.getAttribute("rel") || "").toLowerCase() !== "stylesheet") return;
+  for (const el of [...doc.querySelectorAll("link[href]")]) {
+    if ((el.getAttribute("rel") || "").toLowerCase() !== "stylesheet") continue;
     const target = resolvePath(dir, el.getAttribute("href"));
-    const e = target && byPath.get(target);
-    if (!e) { el.remove(); return; }
+    const bytes = target && await getEntryBytes(target);
+    if (!bytes) { el.remove(); continue; }
     const style = doc.createElement("style");
-    style.textContent = rewriteCssUrls(new TextDecoder().decode(e.bytes), pathDir(target), dataUrl);
+    style.textContent = rewriteCssUrls(new TextDecoder().decode(bytes), pathDir(target), dataUrl);
     el.replaceWith(style);
-  });
+  }
 
-  doc.querySelectorAll("img[src], video[src], audio[src], source[src]").forEach((el) => {
+  for (const el of [...doc.querySelectorAll("img[src], video[src], audio[src], source[src]")]) {
     const target = resolvePath(dir, el.getAttribute("src"));
-    const u = target && dataUrl(target);
+    const u = target && await dataUrl(target);
     if (u) el.setAttribute("src", u); else el.removeAttribute("src");
-  });
+  }
 
-  doc.querySelectorAll("style").forEach((el) => {
-    el.textContent = rewriteCssUrls(el.textContent, dir, dataUrl);
-  });
+  for (const el of [...doc.querySelectorAll("style")]) {
+    el.textContent = await rewriteCssUrls(el.textContent, dir, dataUrl);
+  }
 
-  doc.querySelectorAll("a[href]").forEach((el) => {
+  for (const el of [...doc.querySelectorAll("a[href]")]) {
     const target = resolvePath(dir, el.getAttribute("href"));
-    if (!target) return;
-    const u = blobFor(target);
+    if (!target) continue;
+    const u = await blobFor(target);
     if (u) { el.setAttribute("href", u); el.setAttribute("target", "_blank"); }
-  });
+  }
 
   return "<!DOCTYPE html>\n" + doc.documentElement.outerHTML;
 }
 
-function rewriteCssUrls(css, cssDir, dataUrl) {
-  return css.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (m, q, url) => {
+async function rewriteCssUrls(css, cssDir, dataUrl) {
+  const jobs = [];
+  const rewritten = css.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (m, q, url) => {
     const target = resolvePath(cssDir, url);
-    const u = target && dataUrl(target);
-    return u ? `url("${u}")` : m;
+    if (!target) return m;
+    jobs.push(target);
+    return `__URL_PLACEHOLDER_${jobs.length - 1}__`;
   });
+  const urls = await Promise.all(jobs.map((t) => dataUrl(t)));
+  return rewritten.replace(/__URL_PLACEHOLDER_(\d+)__/g, (m, i) => (urls[+i] ? `url("${urls[+i]}")` : "none"));
 }
 
 function pathDir(p) { return p.includes("/") ? p.slice(0, p.lastIndexOf("/") + 1) : ""; }
@@ -558,23 +604,26 @@ $("#dropzone").addEventListener("click", () => $("#fileinput").click());
 $("#fileinput").addEventListener("change", (e) => { const f = e.target.files[0]; if (f) handleZipFile(f); e.target.value = ""; });
 $("#search").addEventListener("input", (e) => buildTree(e.target.value));
 $("#clearbtn").addEventListener("click", async () => {
-  await dbClear();
-  files = []; byPath.clear(); currentPath = null;
+  await idbClear();
+  try { localStorage.removeItem("ziphost-has"); } catch (_) { }
+  archiveIndex = []; archives.clear(); bytesCache.clear(); currentPath = null;
   $("#app").classList.remove("on");
   $("#dropzone").style.display = "block";
   $("#stats").textContent = "";
   toast("All files removed");
 });
-$("#dlbtn").addEventListener("click", () => {
+$("#dlbtn").addEventListener("click", async () => {
   if (!currentPath) return;
+  const url = await makeBlobUrl(currentPath);
+  if (!url) return;
   const a = document.createElement("a");
-  a.href = makeBlobUrl(currentPath);
+  a.href = url;
   a.download = currentPath.split("/").pop();
   a.click();
 });
-$("#tabbtn").addEventListener("click", () => {
+$("#tabbtn").addEventListener("click", async () => {
   if (!currentPath) return;
-  const url = makeBlobUrl(currentPath);
+  const url = await makeBlobUrl(currentPath);
   if (url) window.open(url, "_blank");
 });
 
@@ -602,7 +651,8 @@ function toast(msg, isErr) {
 /* ---------------- start: bring back remembered files, or load the
  * archive that sits next to this page (GitHub Pages hosting) ---------------- */
 
-const AUTO_ZIP = "youtube-3d-vision.zip"; // archive published alongside this page
+const AUTO_CORE = "youtube-3d-vision-core.zip"; // small archive: source files, loads first (fast)
+const AUTO_ZIP = "youtube-3d-vision.zip";      // full archive: big files stream in afterwards
 
 /**
  * Download the archive that sits next to this page. Large archives are
@@ -611,17 +661,17 @@ const AUTO_ZIP = "youtube-3d-vision.zip"; // archive published alongside this pa
  * them back together byte for byte (ZIP files concatenate exactly).
  * Returns an ArrayBuffer, or null when nothing is published.
  */
-async function fetchPublishedArchive(onProgress) {
+async function fetchPublishedArchive(name, onProgress) {
   // 1. single file?
   try {
-    const res = await fetch(AUTO_ZIP);
+    const res = await fetch(name);
     if (res.ok) return await res.arrayBuffer();
   } catch (_) { /* fall through to parts */ }
 
-  // 2. discover the split parts
+  // 2. discover the split parts, then download several at a time
   const parts = [];
   for (let i = 0; i < 99; i++) {
-    const url = `${AUTO_ZIP}.part${i}`;
+    const url = `${name}.part${i}`;
     let head;
     try { head = await fetch(url, { method: "HEAD" }); } catch (_) { break; }
     if (!head.ok) break;
@@ -630,54 +680,135 @@ async function fetchPublishedArchive(onProgress) {
   if (!parts.length) return null;
 
   const total = parts.reduce((s, p) => s + p.size, 0);
-  const chunks = [];
-  let loaded = 0;
-  for (const p of parts) {
-    const res = await fetch(p.url);
-    if (!res.ok) return null;
-    const buf = new Uint8Array(await res.arrayBuffer());
-    chunks.push(buf);
-    loaded += buf.length;
-    if (onProgress) onProgress(loaded, total);
-  }
+  const chunks = new Array(parts.length);
+  let loaded = 0, next = 0, failed = false;
+  const worker = async () => {
+    while (next < parts.length && !failed) {
+      const i = next++;
+      try {
+        const res = await fetch(parts[i].url);
+        if (!res.ok) { failed = true; return; }
+        chunks[i] = new Uint8Array(await res.arrayBuffer());
+        loaded += chunks[i].length;
+        if (onProgress) onProgress(loaded, total);
+      } catch (_) { failed = true; }
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  if (failed) return null;
   const out = new Uint8Array(total);
   let off = 0;
   for (const c of chunks) { out.set(c, off); off += c.length; }
   return out.buffer;
 }
 
-(async () => {
-  db = await openDB();
-  const stored = await dbGetAll();
-  if (stored.length) { await render(null, false); return; }
+const bgStatus = document.createElement("span");
+bgStatus.style.cssText = "margin-left:14px";
 
-  // Nothing remembered yet: if this page is hosted (https://...github.io/...),
-  // the archive is fetched automatically so no one has to pick any file.
-  if (location.protocol === "http:" || location.protocol === "https:") {
+async function loadPublishedArchive(name, label) {
+  const setProgress = (text, pct) => {
+    $("#ptext").textContent = text;
+    $("#pfill").style.width = pct + "%";
+    if (!$("#progresswrap").classList.contains("on")) {
+      bgStatus.textContent = `${label} ${pct}%`;
+    }
+  };
+  const buf = await fetchPublishedArchive(name, (loaded, total) => {
+    if (total > 0) {
+      const pct = Math.min(100, Math.round((loaded / total) * 100));
+      setProgress(`${label} ${pct}%`, pct);
+    }
+  });
+  if (!buf) return null;
+  return buf;
+}
+
+// Stage 2 — the big files (AI model and engine) stream in quietly
+// afterwards and appear in the list when they arrive.
+async function streamFullArchive() {
+  bgStatus.textContent = "Adding the big files\u2026";
+  document.querySelector("footer").appendChild(bgStatus);
+  try {
+    const buf = await loadPublishedArchive(AUTO_ZIP, "Adding the big files\u2026");
+    if (buf) {
+      const parsed = parseZipIndex(buf);
+      if (parsed.index.size) {
+        archives.set("full", parsed);
+        await idbPut("blob:full", new Blob([buf], { type: "application/zip" }));
+        await storeIndex([...parsed.index.entries()].map(([path, m]) => ({ path, size: m.size, store: "full" })), AUTO_ZIP);
+        await render(null, false);
+        toast(`All files added (${archiveIndex.length} files)`);
+      }
+    }
+  } catch (_) { /* the core stays usable either way */ }
+  bgStatus.textContent = "";
+}
+
+const hasBigFiles = (list) => list.some((f) => f.size > 1_000_000);
+
+(async () => {
+  const t0 = performance.now();
+  window.__loadMarks = { boot: t0, bootAt: performance.now() }; // bootAt: ms since page navigation started
+  const hosted = location.protocol === "http:" || location.protocol === "https:";
+  // A synchronous hint about whether anything was remembered last time:
+  // reading it is instant, so first visits don't wait for the database.
+  let hint = null; // null = unknown
+  try { hint = localStorage.getItem("ziphost-has") === "1"; } catch (_) { }
+  // Start the small core download and the database in parallel: on a first
+  // visit neither waits for the other.
+  const dbPromise = openDB().then((d) => { db = d; });
+  let corePromise = null;
+  if (hosted) corePromise = window.__coreFetch || loadPublishedArchive(AUTO_CORE, "Downloading\u2026");
+
+  if (hint) {
+    // Probably remembered: read the small list only (no file contents).
+    await dbPromise;
+    window.__loadMarks.afterDbOpen = performance.now();
+    const stored = await idbGet("index");
+    window.__loadMarks.afterRead = performance.now();
+    if (stored && stored.entries && stored.entries.length) {
+      archiveIndex = stored.entries;
+      await render(stored.zipName, false);
+      window.__loadMarks.ready = performance.now();
+      toast(`Instant \u2014 remembered from last time (${((performance.now() - t0) / 1000).toFixed(2)}s)`);
+      if (!hasBigFiles(archiveIndex) && hosted) streamFullArchive();
+      return;
+    }
+    // hint was stale: fall through to the first-visit path
+  }
+
+  // First visit (hosted): the files arrive automatically. The list renders
+  // as soon as the small core download finishes \u2014 before that even the
+  // database is not on the critical path.
+  if (hosted && corePromise) {
     try {
       showProgress("Getting your files ready\u2026");
-      const buf = await fetchPublishedArchive((loaded, total) => {
-        if (total > 0) {
-          const pct = Math.min(100, Math.round((loaded / total) * 100));
-          $("#ptext").textContent = `Downloading\u2026 ${pct}%`;
-          $("#pfill").style.width = pct + "%";
-        }
-      });
+      const buf = await corePromise;
+      window.__loadMarks.afterFetch = performance.now();
       if (buf) {
-        const entries = await unzipBytes(buf, (n, total) => {
-          $("#ptext").textContent = `Opening\u2026 ${n} of ${total} files`;
-          $("#pfill").style.width = Math.round((n / total) * 100) + "%";
-        });
-        if (entries.length) {
-          await dbPutAll(entries);
-          await render(AUTO_ZIP, true);
+        const parsed = parseZipIndex(buf); // table of contents only: fast
+        if (parsed.index.size) {
+          archives.set("core", parsed);
+          window.__loadMarks.afterParse = performance.now();
+          archiveIndex = [...parsed.index.entries()].map(([path, m]) => ({ path, size: m.size, store: "core" }));
+          render(AUTO_CORE, true);
+          window.__loadMarks.ready = performance.now();
           hideProgress();
-          toast("All set \u2014 your files are ready");
+          toast(`Ready in ${((performance.now() - t0) / 1000).toFixed(2)}s`);
+          // storage completes while you look
+          await dbPromise;
+          await idbPut("blob:core", new Blob([buf], { type: "application/zip" }));
+          await idbPut("index", { entries: archiveIndex, zipName: AUTO_CORE, when: Date.now() });
+          try { localStorage.setItem("ziphost-has", "1"); } catch (_) { }
+          window.__loadMarks.afterPut = performance.now();
+          streamFullArchive();
           return;
         }
       }
     } catch (_) { /* not hosted with an archive next to it: fall back to drag & drop */ }
     hideProgress();
+  } else {
+    await dbPromise;
   }
 })();
 </script>
