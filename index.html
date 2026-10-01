@@ -173,7 +173,7 @@
 <script>
 /* Start fetching the small core archive immediately (before the app below
  * even runs), so the file list is ready as fast as possible. */
-window.__coreFetch = fetch("youtube-3d-vision-core.zip")
+window.__coreFetch = fetch("youtube-3d-vision-core.zip?v=8")
   .then((r) => (r.ok ? r.arrayBuffer() : null))
   .catch(() => null);
 </script>
@@ -651,6 +651,12 @@ function toast(msg, isErr) {
 /* ---------------- start: bring back remembered files, or load the
  * archive that sits next to this page (GitHub Pages hosting) ---------------- */
 
+// Bump BUILD on every publish. It is appended to every archive request, so a
+// browser (especially a phone) can never keep serving an older copy from its
+// cache after the site is updated.
+const BUILD = "8";
+const vurl = (u) => u + (u.includes("?") ? "&" : "?") + "v=" + BUILD;
+
 const AUTO_CORE = "youtube-3d-vision-core.zip"; // small archive: source files, loads first (fast)
 const AUTO_ZIP = "youtube-3d-vision.zip";      // full archive: big files stream in afterwards
 
@@ -664,7 +670,7 @@ const AUTO_ZIP = "youtube-3d-vision.zip";      // full archive: big files stream
 async function fetchPublishedArchive(name, onProgress) {
   // 1. single file?
   try {
-    const res = await fetch(name);
+    const res = await fetch(vurl(name), { cache: "no-store" });
     if (res.ok) return await res.arrayBuffer();
   } catch (_) { /* fall through to parts */ }
 
@@ -673,7 +679,7 @@ async function fetchPublishedArchive(name, onProgress) {
   for (let i = 0; i < 99; i++) {
     const url = `${name}.part${i}`;
     let head;
-    try { head = await fetch(url, { method: "HEAD" }); } catch (_) { break; }
+    try { head = await fetch(vurl(url), { method: "HEAD" }); } catch (_) { break; }
     if (!head.ok) break;
     parts.push({ url, size: Number(head.headers.get("content-length")) || 0 });
   }
@@ -686,7 +692,7 @@ async function fetchPublishedArchive(name, onProgress) {
     while (next < parts.length && !failed) {
       const i = next++;
       try {
-        const res = await fetch(parts[i].url);
+        const res = await fetch(vurl(parts[i].url));
         if (!res.ok) { failed = true; return; }
         chunks[i] = new Uint8Array(await res.arrayBuffer());
         loaded += chunks[i].length;
