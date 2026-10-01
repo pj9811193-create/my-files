@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>YouTube 3D Vision on Android</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background:#0f0f0f; color:#f1f1f1; font-family: system-ui, -apple-system, Roboto, Arial, sans-serif;
+         font-size:16px; line-height:1.55; padding:20px 18px 40px; max-width:720px; margin:0 auto; }
+  h1 { font-size:24px; margin:0 0 6px; }
+  h2 { font-size:19px; margin:28px 0 8px; }
+  p, li { color:#d6d6d6; }
+  .lede { color:#bbb; font-size:15px; }
+  ol { padding-left:22px; }
+  li { margin:10px 0; }
+  .card { background:#1a1a1a; border:1px solid #333; border-radius:14px; padding:16px 18px; margin:18px 0; }
+  .warn { border-color:#8a6d3b; }
+  .ok { border-color:#2e7d32; }
+  code { background:#242424; padding:2px 6px; border-radius:6px; font-size:14px; }
+  .small { font-size:14px; color:#9a9a9a; }
+</style>
+</head>
+<body>
+  <h1>YouTube 3D Vision on Android</h1>
+  <p class="lede">Make YouTube videos 3D on your phone, with red-cyan glasses or a headset viewer.</p>
+
+  <div class="card warn">
+    <b>Read this first.</b> Chrome on Android <b>cannot</b> run browser add-ons — that is a limit of Chrome itself.
+    To use this on Android you need a browser that <i>can</i> run Chrome add-ons. Good options:
+    <b>Lemur Browser</b>, <b>Mises Browser</b> or <b>Kiwi Browser</b> (free on the Play Store, except Kiwi which may
+    need a direct download). Install one of those first.
+  </div>
+
+  <h2>Steps</h2>
+  <ol>
+    <li><b>Install an add-on-capable browser</b> from the list above, and open it once.</li>
+    <li><b>Get the add-on file.</b> Download <code>youtube-3d-vision-full.crx</code> (about 70 MB — the AI model is
+        inside it, so nothing else is ever downloaded). There is also a small version,
+        <code>youtube-3d-vision-android.crx</code> (8 MB), which fetches the model once on first use instead.</li>
+    <li><b>Turn on add-on installs in that browser:</b> open its menu → <i>Extensions</i> (or <i>Add-ons</i>) →
+        enable <i>Developer mode</i>.</li>
+    <li><b>Install from the file:</b> choose <i>Install from file</i> / <i>Load from file</i> and pick the
+        <code>.crx</code> you downloaded. If your browser only offers "Load unpacked", unzip the file first and pick
+        the folder.</li>
+    <li><b>Open YouTube</b>, play any normal video, and tap the small <b>3D</b> button in the player controls.
+        3D switches itself on after a few seconds — the panel appears as a sheet at the bottom of the screen.</li>
+    <li><b>Put on your glasses.</b> For cheap red-cyan glasses leave it on "3D glasses (red-cyan)". For a 3D TV or a
+        phone VR headset, tap <i>Side-by-side</i>.</li>
+  </ol>
+
+  <h2>What was tested</h2>
+  <div class="card ok">
+    <ul>
+      <li>Driven on a <b>phone-sized screen (412×915) with real touch input</b>: the 3D button is a 48&nbsp;px target,
+          tapping opens the panel, tapping the switch starts 3D, dragging a slider works, and the AI depth runs with
+          stereo output on screen — <b>10/10 checks</b>.</li>
+      <li>The panel is a <b>bottom sheet</b> sized to the display, so it can never be clipped inside the small player.</li>
+      <li>Desktop behaviour is unchanged (full end-to-end suite still 6/6).</li>
+    </ul>
+    <span class="small">Not tested here: installing into Lemur/Kiwi/Mises themselves — those browsers are not
+    available in this test environment. Everything up to that point is verified.</span>
+  </div>
+
+  <h2>If something doesn't work</h2>
+  <ul>
+    <li><b>No 3D button on the video?</b> Some add-on browsers hide the player controls; tap the video once to show
+        them. Also check the add-on is enabled in that browser's extensions page.</li>
+    <li><b>Slow or warm phone?</b> The AI runs on the phone's CPU. Open the panel and set <i>Picture quality</i> to
+        <i>Low</i>, which processes fewer pixels.</li>
+    <li><b>Protected videos</b> (some paid or DRM-locked ones) cannot be read — the panel will say so and normal
+        playback continues.</li>
+  </ul>
+  <p class="small">Everything runs on your phone. No video frames, history or personal data are ever uploaded.</p>
+</body>
+</html>
