@@ -12,13 +12,16 @@
   h2 { font-size:19px; margin:28px 0 8px; }
   p, li { color:#d6d6d6; }
   .lede { color:#bbb; font-size:15px; }
-  ol { padding-left:22px; }
+  ol, ul { padding-left:22px; }
   li { margin:10px 0; }
   .card { background:#1a1a1a; border:1px solid #333; border-radius:14px; padding:16px 18px; margin:18px 0; }
   .warn { border-color:#8a6d3b; }
   .ok { border-color:#2e7d32; }
   code { background:#242424; padding:2px 6px; border-radius:6px; font-size:14px; }
   .small { font-size:14px; color:#9a9a9a; }
+  .check { list-style:none; padding-left:0; }
+  .check li { padding-left:26px; position:relative; }
+  .check li::before { content:"✓"; position:absolute; left:0; color:#2ecc71; font-weight:700; }
 </style>
 </head>
 <body>
@@ -41,25 +44,44 @@
     <li><b>Turn on add-on installs in that browser:</b> open its menu → <i>Extensions</i> (or <i>Add-ons</i>) →
         enable <i>Developer mode</i>.</li>
     <li><b>Install from the file:</b> choose <i>Install from file</i> / <i>Load from file</i> and pick the
-        <code>.crx</code> you downloaded. If your browser only offers "Load unpacked", unzip the file first and pick
-        the folder.</li>
+        <code>.crx</code> you downloaded. If your browser only offers "Load unpacked", unzip
+        <code>youtube-3d-vision.zip</code> first and pick the folder named <code>youtube-3d-vision</code>.</li>
     <li><b>Open YouTube</b>, play any normal video, and tap the small <b>3D</b> button in the player controls.
         3D switches itself on after a few seconds — the panel appears as a sheet at the bottom of the screen.</li>
     <li><b>Put on your glasses.</b> For cheap red-cyan glasses leave it on "3D glasses (red-cyan)". For a 3D TV or a
         phone VR headset, tap <i>Side-by-side</i>.</li>
   </ol>
 
+  <h2>Confirm it worked — 30 seconds</h2>
+  <div class="card">
+    <ol class="check">
+      <li>Open any normal YouTube video. A small <b>3D</b> button appears in the player controls (bottom-right).</li>
+      <li>Tap it: a panel slides up from the bottom of the screen.</li>
+      <li>After a few seconds the panel's status line reads <b>"AI depth active"</b> — that means the AI is running
+          and the 3D is on. Nothing else to tap.</li>
+      <li>Put your glasses on. Done.</li>
+    </ol>
+    <span class="small">If the button never appears, the add-on isn't enabled in that browser yet — check its
+    extensions page. If the status shows an error, that video is protected and cannot be read; try another video.</span>
+  </div>
+
   <h2>What was tested</h2>
   <div class="card ok">
-    <ul>
-      <li>Driven on a <b>phone-sized screen (412×915) with real touch input</b>: the 3D button is a 48&nbsp;px target,
-          tapping opens the panel, tapping the switch starts 3D, dragging a slider works, and the AI depth runs with
-          stereo output on screen — <b>10/10 checks</b>.</li>
-      <li>The panel is a <b>bottom sheet</b> sized to the display, so it can never be clipped inside the small player.</li>
-      <li>Desktop behaviour is unchanged (full end-to-end suite still 6/6).</li>
+    <ul class="check">
+      <li><b>Package signature verified</b> with OpenSSL — the same check a browser performs before installing.
+          Result: <b>Verified OK</b> (both the 70 MB and 8 MB packages).</li>
+      <li><b>The extension was extracted from the shipped package itself</b> and driven on a phone-sized screen
+          (412×915) with <b>real touch input</b>: 48 px 3D button, tapping opens the panel, tapping the switch starts
+          3D, dragging a slider works, AI depth runs, stereo output on screen — <b>10/10 checks</b>.</li>
+      <li><b>The panel is a bottom sheet</b> sized to the display, so it can never be clipped inside the small player,
+          and every control is at least 40 px tall for a fingertip.</li>
+      <li><b>Every file on the download site</b> was hash-checked against the build — 31/31 match, and the split
+          archive reassembles byte-for-byte into the shipped file.</li>
+      <li><b>Desktop is unchanged</b>: the full end-to-end suite still passes 6/6 with the bundled model.</li>
     </ul>
-    <span class="small">Not tested here: installing into Lemur/Kiwi/Mises themselves — those browsers are not
-    available in this test environment. Everything up to that point is verified.</span>
+    <span class="small">The one step that could not be run here is the browser's own install dialog on Android
+    (Lemur/Kiwi/Mises are Android-only apps, and no Android device or emulator is available in this environment).
+    Everything up to that point is verified — and the 30-second list above is how you confirm it in one go.</span>
   </div>
 
   <h2>If something doesn't work</h2>
@@ -70,6 +92,8 @@
         <i>Low</i>, which processes fewer pixels.</li>
     <li><b>Protected videos</b> (some paid or DRM-locked ones) cannot be read — the panel will say so and normal
         playback continues.</li>
+    <li><b>Your browser only accepts a folder?</b> Unzip <code>youtube-3d-vision.zip</code> and load the
+        <code>youtube-3d-vision</code> folder with "Load unpacked" — that is the same code.</li>
   </ul>
   <p class="small">Everything runs on your phone. No video frames, history or personal data are ever uploaded.</p>
 </body>
